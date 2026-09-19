@@ -1,0 +1,29 @@
+[project]
+name = "ebaylister"
+version = "0.1.0"
+description = "Photograph an item, let Claude write the listing, publish it to eBay."
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=1.7,<2",
+    "requests>=2.31",
+    "pydantic>=2.6",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+ebaylister = "ebaylister.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ebaylister*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
