@@ -19,7 +19,7 @@ from pathlib import Path
 from .config import Settings
 from .ebay import EbayClient
 from .ebay import browse, inventory, media, taxonomy
-from .models import IdentifiedItem, Job, ListingDraft, PublishResult
+from .models import CategoryPick, IdentifiedItem, Job, ListingDraft, PriceStats, PublishResult
 from .storage import JobStore
 
 log = logging.getLogger("ebaylister")
@@ -58,14 +58,25 @@ class Pipeline:
 
     # ---------- individual steps (also driven externally by the sell-job skill) ----------
 
+    def _lookup_category_and_comps(self, job: Job) -> None:
+        job.category = taxonomy.pick_category(self.ebay, job.identified.category_search_query)
+        job.prices = browse.price_comps(self.ebay, job.identified.comps_search_query, job.category.category_id)
+
     def set_identified(self, job: Job, item: IdentifiedItem) -> Job:
-        """Store the identification, then look up category, required aspects and comps."""
+        """Store the identification, then look up category, required aspects and comps.
+
+        If the eBay app keys are not configured yet, drafting still proceeds with a
+        placeholder category and no comps; the real lookup happens at publish time."""
         job.identified = item
         job.status = "drafting"
         job.error = None
         self.store.save(job)
-        job.category = taxonomy.pick_category(self.ebay, item.category_search_query)
-        job.prices = browse.price_comps(self.ebay, item.comps_search_query, job.category.category_id)
+        if self.s.missing_ebay_credentials():
+            log.warning("[%s] eBay keys not configured; drafting without category/comps", job.id)
+            job.category = CategoryPick(category_id="", category_name="(eBay not connected yet - category chosen at publish time)")
+            job.prices = PriceStats(query=item.comps_search_query, count=0)
+        else:
+            self._lookup_category_and_comps(job)
         self.store.save(job)
         log.info("[%s] identified: %s (%.0f%%) -> %s", job.id, item.product_name, item.confidence * 100, job.category.category_name)
         return job
@@ -146,6 +157,14 @@ class Pipeline:
             job.status = "publishing"
             job.error = None
             self.store.save(job)
+            if not job.category.category_id:  # drafted before eBay was connected
+                self._lookup_category_and_comps(job)
+                missing = [a for a in job.category.required_aspects if a not in {x.name for x in job.draft.aspects if x.values}]
+                if missing:
+                    raise RuntimeError(
+                        f"eBay category {job.category.category_name!r} requires item specifics the draft lacks: "
+                        f"{', '.join(missing)}. Re-run drafting now that eBay is connected: /sell-job {job.id}"
+                    )
             image_urls = media.upload_images(self.ebay, [Path(p) for p in job.photos])
             currency = job.prices.currency if job.prices and job.prices.count else "USD"
             result: PublishResult = inventory.publish_listing(

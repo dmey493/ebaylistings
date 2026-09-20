@@ -1,5 +1,6 @@
 """Command-line entry point.
 
+  ebaylister doctor                     what is set up, what is still missing (a to-do list)
   ebaylister auth                       one-time: link your eBay account
   ebaylister setup                      one-time: pick business policies, create ship-from location
   ebaylister sell photo1.jpg ... [-n "note"] [--publish]
@@ -22,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import shutil
 import sys
 import time
@@ -63,6 +65,54 @@ def _print_job(job: Job) -> None:
 
 
 # ---------- commands ----------
+
+def readiness(s: Settings) -> list[tuple[bool, str, str]]:
+    """(ok, what, how-to-fix) rows, in the order the seller should do them. No network calls."""
+    rows: list[tuple[bool, str, str]] = []
+    if s.brain == "claude-code":
+        ok = shutil.which(s.claude_cmd) is not None
+        rows.append((ok, f"Claude Code binary ({s.claude_cmd})", "install Claude Code and run `claude` once to log in with your plan"))
+    elif s.brain == "api":
+        ok = bool(os.environ.get("ANTHROPIC_API_KEY"))
+        rows.append((ok, "ANTHROPIC_API_KEY (api brain)", "put an Anthropic API key in .env, or switch to EBAYLISTER_BRAIN=claude-code"))
+    else:
+        rows.append((False, f"EBAYLISTER_BRAIN={s.brain}", "set it to claude-code or api"))
+
+    missing = s.missing_ebay_credentials()
+    rows.append((not missing, f"eBay app keys in .env ({s.ebay_env})",
+                 f"create a keyset at https://developer.ebay.com/my/keys and fill in {', '.join(missing) or 'EBAY_CLIENT_ID/SECRET/RUNAME'}"))
+
+    from .ebay.auth import EbayAuth
+
+    linked = not missing and EbayAuth(s).has_user_token
+    rows.append((linked, "eBay account linked (user token on file)", "run `ebaylister auth`"))
+
+    defaults = s.missing_seller_defaults()
+    rows.append((not defaults, "business policies + ship-from location",
+                 "run `ebaylister setup` and paste the printed IDs into .env" + (f" (missing {', '.join(defaults)})" if defaults else "")))
+    return rows
+
+
+def cmd_doctor(s: Settings, args) -> int:
+    rows = readiness(s)
+    todo = []
+    for ok, what, fix in rows:
+        print(f"  [{'x' if ok else ' '}] {what}")
+        if not ok:
+            todo.append(fix)
+    can_draft = rows[0][0]
+    can_publish = all(ok for ok, _, _ in rows)
+    print()
+    if can_publish:
+        print(f"Ready: drafts AND publishing to eBay ({s.ebay_env}).")
+    elif can_draft:
+        print("Ready to DRAFT listings from photos. Before anything can be PUBLISHED:")
+    else:
+        print("Not ready. To do:")
+    for i, fix in enumerate(todo, 1):
+        print(f"  {i}. {fix}")
+    return 0 if can_publish else 1
+
 
 def cmd_auth(s: Settings, args) -> int:
     from .ebay.auth import EbayAuth
@@ -299,6 +349,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
+    sub.add_parser("doctor", help="show what is set up and what is still missing").set_defaults(fn=cmd_doctor)
     sub.add_parser("auth", help="link your eBay account").set_defaults(fn=cmd_auth)
     sub.add_parser("setup", help="choose business policies and create ship-from location").set_defaults(fn=cmd_setup)
 

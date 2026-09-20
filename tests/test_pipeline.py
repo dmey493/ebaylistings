@@ -145,3 +145,34 @@ def test_claude_code_brain_missing_binary(settings, photo):
     settings.claude_cmd = "definitely-not-a-real-binary-xyz"
     job = Pipeline(settings, ebay=object()).run([photo])
     assert job.status == "failed" and "EBAYLISTER_BRAIN=api" in job.error
+
+
+def test_drafting_works_before_ebay_is_connected(settings, photo, identified, category, prices, draft, monkeypatch):
+    settings.ebay_client_id = ""  # no eBay keys yet
+    calls = []
+    monkeypatch.setattr(pl.taxonomy, "pick_category", lambda client, q: calls.append("cat") or category)
+    monkeypatch.setattr(pl.browse, "price_comps", lambda client, q, cat=None: prices)
+    monkeypatch.setattr(pl.media, "upload_images", lambda client, paths: [])
+    monkeypatch.setattr(pl.inventory, "publish_listing", lambda client, sku, d, cid, urls, currency="USD": PublishResult(sku=sku, offer_id="O", listing_id="L", listing_url="u", image_urls=urls))
+
+    pipe = Pipeline(settings, writer=FakeWriter(identified, draft), ebay=object())
+    job = pipe.run([photo])
+    assert job.status == "awaiting_review"
+    assert job.category.category_id == "" and calls == []  # no eBay call was attempted
+
+    # later, keys arrive: publish resolves the category first
+    settings.ebay_client_id = "cid"
+    job = pipe.publish(job)
+    assert job.status == "published" and calls == ["cat"] and job.category.category_id == "112529"
+
+
+def test_publish_after_late_category_needs_missing_aspects(settings, photo, identified, category, prices, draft, monkeypatch):
+    settings.ebay_client_id = ""
+    pipe = Pipeline(settings, writer=FakeWriter(identified, draft.model_copy(update={"aspects": []})), ebay=object())
+    job = pipe.run([photo])
+    settings.ebay_client_id = "cid"
+    monkeypatch.setattr(pl.taxonomy, "pick_category", lambda client, q: category)
+    monkeypatch.setattr(pl.browse, "price_comps", lambda client, q, cat=None: prices)
+    monkeypatch.setattr(pl.media, "upload_images", lambda client, paths: [])
+    job = pipe.publish(job)
+    assert job.status == "failed" and "Brand" in job.error and "/sell-job" in job.error

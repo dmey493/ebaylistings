@@ -44,13 +44,17 @@ The eBay half is plain Python. The "look at the photos and write the listing" ha
 
 A Claude.ai plan does not include Messages API access, and Anthropic's terms do not allow using plan credentials from your own app, which is why the default goes through Claude Code. Both brains produce the same `job.json`, so the review page, `publish`, `watch` and `serve` behave identically.
 
-You can also skip the Python trigger entirely and just talk to Claude Code in this repo:
+### The simplest way: `/sell` inside Claude Code
+
+Open Claude Code in this repo and type:
 
 ```
-ebaylister job new IMG_1.jpg IMG_2.jpg -n "no charger"     # prints the job id
-claude "/sell-job <that id>"                               # or type /sell-job <id> inside an open session
-ebaylister publish <that id>
+/sell ~/Pictures/IMG_1.jpg ~/Pictures/IMG_2.jpg works fine, no charger
 ```
+
+That creates the job, looks at the photos, writes the draft, and then runs `ebaylister doctor`. If eBay is not connected yet it shows the draft anyway plus a numbered to-do list (create the developer keyset, `ebaylister auth`, `ebaylister setup`); once everything is green it asks whether to publish. Photos must be files on the machine (synced from your phone), not images pasted into the chat, because eBay needs the files to upload. `/sell-job <id>` re-runs drafting for an existing job, e.g. after you add a note.
+
+`ebaylister doctor` can be run any time to see what is still missing.
 
 ## One-time setup
 
@@ -95,7 +99,8 @@ Each request is a folder under `data/jobs/<id>/` with the photos and a `job.json
 
 | File | Role |
 |---|---|
-| `.claude/skills/sell-job/SKILL.md` | The `claude-code` brain: the instructions Claude Code follows for one job (look at photos → `identified.json` → `draft.json`). |
+| `.claude/skills/sell/SKILL.md` | The interactive entry point: photos + note → job → draft → readiness report. |
+| `.claude/skills/sell-job/SKILL.md` | The `claude-code` brain: the instructions Claude Code follows for one job (look at photos → `identified.json` → `draft.json`). Also what the headless run executes. |
 | `ebaylister/identify.py` | The `api` brain: the same two steps as direct Messages API calls with structured outputs. |
 | `ebaylister/models.py` | The schemas. Field descriptions double as instructions to the model. |
 | `ebaylister/ebay/auth.py` | OAuth: user consent URL, code exchange, refresh, application token, token file. |

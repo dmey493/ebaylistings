@@ -52,3 +52,24 @@ def test_schema_command_prints_json_schema(settings, monkeypatch, capsys):
     assert rc == 0
     schema = json.loads(out)
     assert "condition" in schema["properties"] and "USED_GOOD" in json.dumps(schema)
+
+
+def test_doctor_lists_todo(settings, monkeypatch, capsys):
+    settings.brain = "claude-code"
+    settings.claude_cmd = "definitely-not-a-real-binary-xyz"
+    settings.ebay_client_id = ""
+    settings.return_policy_id = ""
+    rc, out, _ = _run(settings, ["doctor"], monkeypatch, capsys)
+    assert rc == 1
+    assert "[ ] Claude Code binary" in out
+    assert "[ ] eBay app keys" in out
+    assert "developer.ebay.com" in out and "ebaylister auth" in out and "ebaylister setup" in out
+
+
+def test_doctor_ready(settings, monkeypatch, capsys, tmp_path):
+    settings.brain = "claude-code"
+    settings.claude_cmd = "sh"  # anything on PATH
+    settings.token_path.parent.mkdir(parents=True, exist_ok=True)
+    settings.token_path.write_text('{"refresh_token": "r"}')
+    rc, out, _ = _run(settings, ["doctor"], monkeypatch, capsys)
+    assert rc == 0 and "Ready: drafts AND publishing" in out
