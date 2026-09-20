@@ -8,6 +8,13 @@
   ebaylister jobs                       list recent jobs
   ebaylister watch                      poll data/inbox/<folder>/ for new photo sets
   ebaylister serve                      run the phone-friendly web UI
+
+Plumbing used by the Claude Code `sell-job` skill (or any other external brain):
+  ebaylister job new photo1.jpg ... [-n "note"]     create a job, print its id
+  ebaylister job show JOB_ID                        print job.json
+  ebaylister job identified JOB_ID FILE.json        store identification; fetch category + comps
+  ebaylister job draft JOB_ID FILE.json             store the listing draft (-> awaiting_review)
+  ebaylister schema identified|draft                print the JSON schema for those files
 """
 
 from __future__ import annotations
@@ -207,6 +214,85 @@ def cmd_serve(s: Settings, args) -> int:
     return 0
 
 
+def _read_json_arg(path: str) -> dict:
+    text = sys.stdin.read() if path == "-" else Path(path).read_text()
+    return json.loads(text)
+
+
+def cmd_job_new(s: Settings, args) -> int:
+    from .storage import JobStore
+
+    photos = [Path(p) for p in args.photos]
+    for p in photos:
+        if not p.is_file():
+            print(f"not a file: {p}", file=sys.stderr)
+            return 2
+    job = JobStore(s).create(photos, note=args.note or "")
+    print(job.id)
+    return 0
+
+
+def cmd_job_show(s: Settings, args) -> int:
+    from .storage import JobStore
+
+    print(JobStore(s).load(args.job_id).model_dump_json(indent=2))
+    return 0
+
+
+def cmd_job_identified(s: Settings, args) -> int:
+    from .models import IdentifiedItem
+    from .storage import JobStore
+
+    pipe = _pipeline(s)
+    job = JobStore(s).load(args.job_id)
+    try:
+        item = IdentifiedItem.model_validate(_read_json_arg(args.file))
+        job = pipe.set_identified(job, item)
+    except Exception as e:
+        job.status = "failed"
+        job.error = f"{type(e).__name__}: {e}"
+        pipe.store.save(job)
+        print(f"error: {job.error}", file=sys.stderr)
+        return 1
+    out = {
+        "category": job.category.model_dump(),
+        "comps": job.prices.model_dump() if job.prices else None,
+        "note": job.note,
+    }
+    print(json.dumps(out, indent=2, default=str))
+    return 0
+
+
+def cmd_job_draft(s: Settings, args) -> int:
+    from .models import ListingDraft
+    from .storage import JobStore
+
+    pipe = _pipeline(s)
+    job = JobStore(s).load(args.job_id)
+    try:
+        draft = ListingDraft.model_validate(_read_json_arg(args.file))
+        missing = [a for a in (job.category.required_aspects if job.category else []) if a not in {x.name for x in draft.aspects if x.values}]
+        if missing:
+            raise ValueError(f"draft is missing required item specifics: {', '.join(missing)}")
+        job = pipe.set_draft(job, draft)
+    except Exception as e:
+        job.status = "failed"
+        job.error = f"{type(e).__name__}: {e}"
+        pipe.store.save(job)
+        print(f"error: {job.error}", file=sys.stderr)
+        return 1
+    _print_job(job)
+    return 0
+
+
+def cmd_schema(s: Settings, args) -> int:
+    from .models import IdentifiedItem, ListingDraft
+
+    model = IdentifiedItem if args.which == "identified" else ListingDraft
+    print(json.dumps(model.model_json_schema(), indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="ebaylister", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--env-file", default=".env")
@@ -246,6 +332,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--host", default="0.0.0.0")
     sp.add_argument("--port", type=int, default=8000)
     sp.set_defaults(fn=cmd_serve)
+
+    jp = sub.add_parser("job", help="low-level job steps (used by the Claude Code skill)")
+    jsub = jp.add_subparsers(dest="job_cmd", required=True)
+    j = jsub.add_parser("new")
+    j.add_argument("photos", nargs="+")
+    j.add_argument("-n", "--note")
+    j.set_defaults(fn=cmd_job_new)
+    j = jsub.add_parser("show")
+    j.add_argument("job_id")
+    j.set_defaults(fn=cmd_job_show)
+    j = jsub.add_parser("identified")
+    j.add_argument("job_id")
+    j.add_argument("file", help="JSON file matching `ebaylister schema identified` ('-' for stdin)")
+    j.set_defaults(fn=cmd_job_identified)
+    j = jsub.add_parser("draft")
+    j.add_argument("job_id")
+    j.add_argument("file", help="JSON file matching `ebaylister schema draft` ('-' for stdin)")
+    j.set_defaults(fn=cmd_job_draft)
+
+    sp = sub.add_parser("schema", help="print the JSON schema the skill must produce")
+    sp.add_argument("which", choices=["identified", "draft"])
+    sp.set_defaults(fn=cmd_schema)
     return p
 
 

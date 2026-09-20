@@ -15,7 +15,7 @@ PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic"}
 
 class JobStore:
     def __init__(self, settings: Settings):
-        self.root: Path = settings.jobs_dir
+        self.root: Path = settings.jobs_dir.resolve()
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _dir(self, job_id: str) -> Path:

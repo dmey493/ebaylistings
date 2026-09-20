@@ -49,6 +49,13 @@ class Settings:
     data_dir: Path = field(default_factory=lambda: Path("./data"))
     auto_publish: bool = False
 
+    # Which "brain" identifies the item and writes the listing:
+    #   claude-code - runs `claude -p` (headless Claude Code) with the sell-job skill; covered by a Claude plan
+    #   api         - calls the Messages API directly with ANTHROPIC_API_KEY (pay-as-you-go)
+    brain: str = "claude-code"
+    claude_cmd: str = "claude"
+    repo_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent.parent)
+
     # ---- derived ----
     @property
     def is_sandbox(self) -> bool:
@@ -118,6 +125,9 @@ def load_settings(dotenv: Path | None = None) -> Settings:
         fulfillment_policy_id=env.get("EBAY_FULFILLMENT_POLICY_ID", ""),
         payment_policy_id=env.get("EBAY_PAYMENT_POLICY_ID", ""),
         return_policy_id=env.get("EBAY_RETURN_POLICY_ID", ""),
-        data_dir=Path(env.get("EBAYLISTER_DATA_DIR", "./data")),
+        data_dir=Path(env.get("EBAYLISTER_DATA_DIR", "./data")).resolve(),
         auto_publish=_bool(env.get("EBAYLISTER_AUTO_PUBLISH"), False),
+        brain=env.get("EBAYLISTER_BRAIN", "claude-code").strip().lower(),
+        claude_cmd=env.get("EBAYLISTER_CLAUDE_CMD", "claude"),
+        repo_dir=Path(env.get("EBAYLISTER_REPO_DIR", str(Path(__file__).resolve().parent.parent))),
     )

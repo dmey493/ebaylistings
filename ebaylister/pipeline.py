@@ -1,19 +1,32 @@
-"""Orchestration: photos -> identification -> category + comps -> draft -> (review) -> publish."""
+"""Orchestration: photos -> identification -> category + comps -> draft -> (review) -> publish.
+
+The "brain" (identify + write) is pluggable:
+  * claude-code: a headless Claude Code run (`claude -p`) executes the `sell-job` skill in
+    .claude/skills/, which calls back into `ebaylister job ...` to store its results.
+    This runs on a Claude subscription plan - no API key.
+  * api: direct Messages API calls via ListingWriter (needs ANTHROPIC_API_KEY).
+Everything eBay-side is identical for both.
+"""
 
 from __future__ import annotations
 
 import logging
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 from .config import Settings
 from .ebay import EbayClient
 from .ebay import browse, inventory, media, taxonomy
-from .identify import ListingWriter
-from .models import Job, PublishResult
+from .models import IdentifiedItem, Job, ListingDraft, PublishResult
 from .storage import JobStore
 
 log = logging.getLogger("ebaylister")
+
+# Tools the headless Claude Code run may use without prompting: look at photos,
+# write its JSON files into the job folder, and call back into this CLI.
+CLAUDE_CODE_ALLOWED_TOOLS = "Read,Write,Bash(ebaylister *)"
 
 
 def _sku_for(job: Job) -> str:
@@ -22,27 +35,99 @@ def _sku_for(job: Job) -> str:
 
 
 class Pipeline:
-    def __init__(self, settings: Settings, store: JobStore | None = None, writer: ListingWriter | None = None, ebay: EbayClient | None = None):
+    def __init__(self, settings: Settings, store: JobStore | None = None, writer=None, ebay: EbayClient | None = None):
         self.s = settings
         self.store = store or JobStore(settings)
-        self.writer = writer or ListingWriter(settings)
-        self.ebay = ebay or EbayClient(settings)
+        self._writer = writer
+        self._ebay = ebay
+
+    # Both clients are built lazily so that e.g. `ebaylister job new` never needs credentials.
+    @property
+    def ebay(self) -> EbayClient:
+        if self._ebay is None:
+            self._ebay = EbayClient(self.s)
+        return self._ebay
+
+    @property
+    def writer(self):
+        if self._writer is None:
+            from .identify import ListingWriter
+
+            self._writer = ListingWriter(self.s)
+        return self._writer
+
+    # ---------- individual steps (also driven externally by the sell-job skill) ----------
+
+    def set_identified(self, job: Job, item: IdentifiedItem) -> Job:
+        """Store the identification, then look up category, required aspects and comps."""
+        job.identified = item
+        job.status = "drafting"
+        job.error = None
+        self.store.save(job)
+        job.category = taxonomy.pick_category(self.ebay, item.category_search_query)
+        job.prices = browse.price_comps(self.ebay, item.comps_search_query, job.category.category_id)
+        self.store.save(job)
+        log.info("[%s] identified: %s (%.0f%%) -> %s", job.id, item.product_name, item.confidence * 100, job.category.category_name)
+        return job
+
+    def set_draft(self, job: Job, draft: ListingDraft) -> Job:
+        if job.identified is None or job.category is None:
+            raise ValueError("Identify the item before drafting")
+        draft.title = draft.title.strip()[:80]
+        job.draft = draft
+        job.status = "awaiting_review"
+        job.error = None
+        self.store.save(job)
+        currency = job.prices.currency if job.prices else "USD"
+        log.info("[%s] draft ready: %r @ %s %.2f", job.id, draft.title, currency, draft.price)
+        return job
+
+    # ---------- brains ----------
+
+    def _draft_with_api(self, job: Job) -> Job:
+        job.status = "identifying"
+        self.store.save(job)
+        item = self.writer.identify([Path(p) for p in job.photos], job.note)
+        self.set_identified(job, item)
+        return self.set_draft(job, self.writer.draft(job.identified, job.category, job.prices, job.note))
+
+    def _draft_with_claude_code(self, job: Job) -> Job:
+        exe = shutil.which(self.s.claude_cmd) or self.s.claude_cmd
+        if not Path(exe).exists() and shutil.which(exe) is None:
+            raise RuntimeError(
+                f"Claude Code binary {self.s.claude_cmd!r} not found. Install Claude Code, or set "
+                "EBAYLISTER_CLAUDE_CMD, or use EBAYLISTER_BRAIN=api with an API key."
+            )
+        job.status = "identifying"
+        self.store.save(job)
+        cmd = [
+            exe, "-p", f"/sell-job {job.id}",
+            "--allowedTools", CLAUDE_CODE_ALLOWED_TOOLS,
+            "--add-dir", str(self.s.data_dir.resolve()),  # photos/job files may live outside the repo
+        ]
+        log.info("[%s] running headless Claude Code: %s", job.id, " ".join(cmd))
+        proc = subprocess.run(cmd, cwd=self.s.repo_dir, capture_output=True, text=True, timeout=1800)
+        (self.store.root / job.id / "claude-code.log").write_text(
+            f"$ {' '.join(cmd)}\nexit={proc.returncode}\n\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+        )
+        fresh = self.store.load(job.id)  # the skill wrote its results through `ebaylister job ...`
+        if fresh.status != "awaiting_review":
+            tail = (proc.stderr or proc.stdout).strip()[-600:]
+            raise RuntimeError(
+                f"Claude Code run ended with status {fresh.status!r} (exit {proc.returncode}). "
+                f"See {self.store.root / job.id / 'claude-code.log'}. {tail}"
+            )
+        return fresh
 
     # ---- step 1: photos -> reviewed draft ----
     def draft(self, job: Job) -> Job:
         try:
-            job.status = "identifying"
-            self.store.save(job)
-            job.identified = self.writer.identify([Path(p) for p in job.photos], job.note)
-            log.info("[%s] identified: %s (%.0f%%)", job.id, job.identified.product_name, job.identified.confidence * 100)
-
-            job.status = "drafting"
-            self.store.save(job)
-            job.category = taxonomy.pick_category(self.ebay, job.identified.category_search_query)
-            job.prices = browse.price_comps(self.ebay, job.identified.comps_search_query, job.category.category_id)
-            job.draft = self.writer.draft(job.identified, job.category, job.prices, job.note)
-            job.status = "awaiting_review"
-            log.info("[%s] draft ready: %r @ %s %.2f", job.id, job.draft.title, job.prices.currency, job.draft.price)
+            if self.s.brain == "api":
+                job = self._draft_with_api(job)
+            elif self.s.brain == "claude-code":
+                job = self._draft_with_claude_code(job)
+            else:
+                raise ValueError(f"Unknown EBAYLISTER_BRAIN={self.s.brain!r} (use claude-code or api)")
         except Exception as e:  # keep the failure with the job so the UI/CLI can show it
             log.exception("[%s] drafting failed", job.id)
             job.status = "failed"
